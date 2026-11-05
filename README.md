@@ -1,20 +1,20 @@
-# GoTimer – grandMA3 Plugin (0.4.0)
+# GoTimer – grandMA3 Plugin (0.5.0)
 
 Misst im Theaterbetrieb die Zeit zwischen zwei Go+ und schreibt sie in die
 Note der Cue, die durch das Go+ ausgelöst wurde:
 
 ```
-[GT 0:41 (0:38-0:45) L0:42 n4] Stichwort: "...und dann ging das Licht aus"
-     │    │          │      │
-     │    │          │      └ Anzahl gewerteter Durchläufe
-     │    │          └ letzter Durchlauf
+[GT 0:41 (0:38-0:45) L0:42 n4] Stichwort: "...und dann ging das Licht aus" {42 38 45 41}
+     │    │          │      │                                                │
+     │    │          │      └ Anzahl Durchläufe                              └ Rohdaten in vollen Sekunden
+     │    │          └ letzter Durchlauf                                       (neuester zuletzt)
      │    └ Range (min–max)
      └ Mittelwert
 ```
 
 Steht man in Cue 11, zeigt die Note von **Cue 12** (= Next), wie lange nach dem
 Go in Cue 11 üblicherweise das nächste Go kommt. Eigener Note-Text bleibt erhalten,
-nur der `[GT …]`-Block wird ersetzt.
+nur der `[GT …]`-Block und die Rohdaten am Ende werden ersetzt.
 
 ## Installation (onPC macOS / Konsole)
 
@@ -46,6 +46,7 @@ nur der `[GT …]`-Block wird ersetzt.
 | `Plugin "GoTimer" "timer 1"` / `"timer on"` / `"timer off"` | Timer aus dem Timer-Pool bei jedem Go steuern. Standard: aus |
 | `Plugin "GoTimer" "tmode auto"` | `auto` (Countdown wenn Daten da, sonst Stopwatch) · `countdown` · `stopwatch` |
 | `Plugin "GoTimer" "gui"` | Einstellungs-Dialog öffnen (siehe unten) |
+| `Plugin "GoTimer" "diag"` | Fehlersuche: zeigt den Status und testet das Schreiben an der nächsten Cue, stellt deren Note danach wieder her |
 | `Plugin "GoTimer" "display"` / `"display on"` / `"display off"` | Live-Anzeige umschalten (siehe unten) |
 
 ## GUI (seit 0.3.0)
@@ -66,19 +67,17 @@ die aktuelle Cue und die nächste Go-Cue mit ihrem Mittelwert.
 | **Timer-Modus** | Auto · Countdown · Stopwatch |
 | **Zeit in Anzeige** | Vergleichszeit oben in der Live-Anzeige: Durchschnitt oder letzter Durchlauf |
 | Button **OK** | übernehmen und schließen |
-| Button **Anzeige** | übernehmen, schließen und Live-Anzeige umschalten |
 | Button **Go-Makro** | legt das Makro „GoTimer Go“ im ersten freien Platz an. Ein vorhandenes wird nicht verändert |
-| Button **Statistik** | Liste aller Cues mit Messwerten (avg, Range, letzt, n), max. 30 Zeilen |
 | Button **Break** | Referenz verwerfen und Timer stoppen |
 | Button **Reset Sequenz** | mit Rückfrage alle Messwerte der Sequenz löschen |
 | Button **Abbrechen** | schließen, ohne zu übernehmen |
 
-Statistik, Break und Reset übernehmen die Einstellungen ebenfalls und öffnen den Dialog danach wieder.
+Go-Makro, Break und Reset übernehmen die Einstellungen ebenfalls und öffnen den Dialog danach wieder.
 
 ## Live-Anzeige (seit 0.4.0)
 
 Eigenes, verschiebbares Fenster auf dem Display, das gerade den Fokus hat. Antippen des Plugins
-im Pool schaltet es an und aus, alternativ `Plugin "GoTimer" "display"` oder **Anzeige** im Menü.
+im Pool schaltet es an und aus, alternativ `Plugin "GoTimer" "display"`.
 
 ```
 0:53 / ~0:41  (+0:12)
@@ -130,9 +129,15 @@ Grenzen in `CFG` oben in `GoTimer.lua` anpassbar.
 
 ## Datenhaltung
 
-- **UserVars** `GT_S<seq>_C<cueNo>` = `n;sum;min;max;last` (volle Genauigkeit), `GT_REC` = 0/1
-- **Fallback**: fehlt die UserVar (anderer User-Profil, neue Show-Kopie), werden die Werte
-  aus dem `[GT …]`-Block der Note rekonstruiert (auf Sekunden gerundet) und weitergeführt.
+- **Messwerte** liegen seit 0.5.0 nur noch in der Note jeder Cue: die letzten 10 Durchläufe in vollen
+  Sekunden am Ende der Note. Beim elften fällt der älteste heraus, alle Werte im `[GT …]`-Block beziehen
+  sich auf die gespeicherten Durchläufe. Dadurch wandern sie beim Kopieren und Umnummerieren mit der Cue
+  mit und hängen nicht am User-Profil. Der `{…}`-Block sollte nicht von Hand geändert werden.
+- **Einstellungen** liegen weiter in UserVars (`GT_REC`, `GT_TIMER`, `GT_TMODE` usw.).
+- **Update von 0.4.0:** Notes ohne Rohdaten werden weiter angezeigt. Beim nächsten Durchlauf wird aus dem
+  `[GT …]`-Block eine Startliste mit gleichem Mittelwert und gleicher Range erzeugt. Das sind keine echten
+  Einzelzeiten, sie rutschen mit neuen Durchläufen heraus. Sofort saubere Werte gibt es mit `reset`.
+  Alte UserVars `GT_S…` werden dabei aufgeräumt.
 
 ## Teststatus (grandMA3 2.3.2.0)
 
@@ -150,6 +155,7 @@ Grenzen in `CFG` oben in `GoTimer.lua` anpassbar.
 | Farben der Anzeige, `Esc` schließt nicht, X schließt | auf MA3 getestet |
 | Button **Config** in der Anzeige | auf MA3 getestet |
 | Dauerbetrieb über 30 min | noch nicht auf MA3 bestätigt |
+| Rohdaten in der Cue-Note, Übernahme alter Werte, Kopieren, Reset, Speichern und Laden | auf MA3 getestet |
 
 ## Bekannte Einschränkungen
 

@@ -17,13 +17,13 @@
     Plugin "GoTimer" "reset 5"      -> dito für Sequenz 5
     Plugin "GoTimer" "timer 1"      -> Timer 1 aus dem Timer-Pool steuern ("timer on|off", Standard: aus)
     Plugin "GoTimer" "tmode auto"   -> auto|countdown|stopwatch
-    Plugin "GoTimer" "gui"          -> Einstellungs-Dialog (Aufnahme, Timer, Statistik, Break, Reset)
+    Plugin "GoTimer" "gui"          -> Einstellungs-Dialog (Aufnahme, Timer, Go-Makro, Break, Reset)
     Plugin "GoTimer" "display"      -> Live-Anzeige an/aus ("display on|off")
 
   Datenhaltung:
-    Primär UserVars:  GT_S<seq>_C<cueNo>  =  "n;sum;min;max;last"  (Sekunden)
-    Fallback:         Marker-Block in der Cue-Note "[GT 0:41 (0:38-0:45) L0:42 n4]"
-                      (wird gelesen, wenn die UserVar fehlt, z.B. anderer User)
+    Messwerte:        in der Note jeder Cue, "[GT 0:41 (0:38-0:45) L0:42 n4] Text {42 38 45 41}"
+                      {…} = letzte 10 Durchläufe in vollen Sekunden, der neueste zuletzt
+    Einstellungen:    UserVars (GT_REC, GT_TIMER, GT_TMODE, ...)
 ]]
 
 local pluginName    = select(1, ...)
@@ -39,7 +39,9 @@ local CFG = {
   SETTLE_SEC    = 0.05,    -- kurz warten, bis MA den Cue-Wechsel übernommen hat
   VAR_PREFIX    = "GT_",
   VERBOSE       = true,    -- Meldungen im Command-Line-Feedback
+  VERSION       = "0.5.0",
   GO_MACRO_NAME = "GoTimer Go",
+  MAX_RUNS      = 10,      -- gespeicherte Durchläufe pro Cue, der älteste fällt heraus
   TIMER_ALERT   = "None",  -- Countdown-Alert bei 0:00, wenn in der GUI "Popup" AUS ist
 
   -- Live-Anzeige. Farben: Name aus ColorGroups.Global oder "Gruppe.Name"
@@ -176,40 +178,81 @@ local function cueLabel(cue)
 end
 
 -- ===================== Statistik-Speicher =====================
-local function varKey(seq, cue)
+-- Alle Messwerte liegen in der Note der Cue und wandern so mit ihr mit:
+--   [GT 0:41 (0:38-0:45) L0:42 n4] eigener Text {42 38 45 41}
+-- Die Zahlen in {} sind die letzten Durchläufe in vollen Sekunden, der neueste zuletzt.
+local MARKER_PATTERN = "%[GT [^%]]*%]"
+local SUMMARY_PATTERN = "%[GT (%d+:%d%d) %((%d+:%d%d)%-(%d+:%d%d)%) L(%d+:%d%d) n(%d+)%]"
+local RUNS_PATTERN = "%s*{([%d ]*)}%s*$"
+
+local function trim(text)
+  return (text:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- UserVar früherer Versionen (bis 0.4.0), wird nur noch aufgeräumt
+local function legacyVarKey(seq, cue)
   local cueNo = tostring(getProp(cue, "no")):gsub("%.", "p")
   return string.format("%sS%s_C%s", CFG.VAR_PREFIX, tostring(seq.no), cueNo)
 end
 
-local MARKER_PATTERN = "%[GT [^%]]*%]"
-
-local function statsFromNote(cue)
+-- Zerlegt eine Note in eigenen Text, Rohdaten und Zusammenfassung.
+-- {…} zählt nur, wenn auch ein [GT …]-Block da ist, damit eigener Text sicher bleibt.
+local function splitNote(cue)
   local note = tostring(getProp(cue, "note") or "")
-  local avg, mn, mx, last, n =
-    note:match("%[GT (%d+:%d%d) %((%d+:%d%d)%-(%d+:%d%d)%) L(%d+:%d%d) n(%d+)%]")
-  if not avg then return nil end
-  n = tonumber(n)
-  return {
-    n = n, sum = parseTime(avg) * n,
-    min = parseTime(mn), max = parseTime(mx), last = parseTime(last),
-  }
+  if not note:find(MARKER_PATTERN) then return trim(note), nil, nil end
+
+  local summary
+  local avg, mn, mx, last, n = note:match(SUMMARY_PATTERN)
+  if avg then
+    summary = { n = tonumber(n), avg = parseTime(avg), min = parseTime(mn),
+                max = parseTime(mx), last = parseTime(last) }
+  end
+
+  local text = note:gsub("%s*" .. MARKER_PATTERN .. "%s*", " ")
+  local runs
+  local raw = text:match(RUNS_PATTERN)
+  if raw then
+    runs = {}
+    for v in raw:gmatch("%d+") do runs[#runs + 1] = tonumber(v) end
+    if #runs == 0 then runs = nil end
+    text = text:gsub(RUNS_PATTERN, "")
+  end
+  return trim(text), runs, summary
+end
+
+local function statsFromRuns(runs)
+  local s = { n = #runs, sum = 0, min = runs[1], max = runs[1], last = runs[#runs] }
+  for _, v in ipairs(runs) do
+    s.sum = s.sum + v
+    s.min = math.min(s.min, v)
+    s.max = math.max(s.max, v)
+  end
+  return s
 end
 
 local function loadStats(seq, cue)
-  local raw = GetVar(UserVars(), varKey(seq, cue))
-  if raw then
-    local n, sum, mn, mx, last = tostring(raw):match("^([^;]+);([^;]+);([^;]+);([^;]+);([^;]+)$")
-    if n then
-      return { n = tonumber(n), sum = tonumber(sum), min = tonumber(mn),
-               max = tonumber(mx), last = tonumber(last) }
-    end
+  local _, runs, summary = splitNote(cue)
+  if runs then return statsFromRuns(runs) end
+  if summary then -- Note aus einer früheren Version, noch ohne Rohdaten
+    return { n = summary.n, sum = summary.avg * summary.n,
+             min = summary.min, max = summary.max, last = summary.last }
   end
-  return statsFromNote(cue) -- Fallback
+  return nil
 end
 
-local function saveStats(seq, cue, s)
-  SetVar(UserVars(), varKey(seq, cue),
-    string.format("%d;%.2f;%.2f;%.2f;%.2f", s.n, s.sum, s.min, s.max, s.last))
+-- Macht aus einer alten Zusammenfassung eine Startliste mit gleichem Mittelwert und gleicher
+-- Range. Das sind keine echten Einzelzeiten, sie rutschen aber mit neuen Durchläufen heraus.
+local function runsFromSummary(summary)
+  -- Platz für den neuen Durchlauf lassen, sonst fiele das Minimum sofort heraus
+  local n = math.min(summary.n, CFG.MAX_RUNS - 1)
+  if n <= 0 then return {} end
+  if n == 1 then return { summary.avg } end
+  local runs = { summary.min }
+  local rest = n > 2 and (summary.avg * n - summary.min - summary.max) / (n - 2) or 0
+  rest = math.floor(math.max(summary.min, math.min(summary.max, rest)) + 0.5)
+  for _ = 1, n - 2 do runs[#runs + 1] = rest end
+  runs[#runs + 1] = summary.max
+  return runs
 end
 
 local function markerText(s)
@@ -217,37 +260,41 @@ local function markerText(s)
     fmtTime(s.sum / s.n), fmtTime(s.min), fmtTime(s.max), fmtTime(s.last), s.n)
 end
 
-local function stripMarker(note)
-  note = note:gsub("%s*" .. MARKER_PATTERN .. "%s*", " ")
-  return (note:gsub("^%s+", ""):gsub("%s+$", ""))
+-- Schreibt die Note und liest sie zurück. Das Pult kann Werte ohne Lua-Fehler ablehnen.
+local function setNoteVerified(cue, text)
+  setProp(cue, "note", text)
+  if tostring(getProp(cue, "note") or "") == text then return true end
+  pcall(function() cue:Set("Note", text) end)
+  return tostring(getProp(cue, "note") or "") == text
 end
 
-local function writeNote(cue, s)
-  local userText = stripMarker(tostring(getProp(cue, "note") or ""))
+local function writeNote(cue, userText, runs, s)
   local marker = markerText(s)
-  local newNote
-  if userText == "" then
-    newNote = marker
-  elseif CFG.MARKER_FRONT then
-    newNote = marker .. " " .. userText
-  else
-    newNote = userText .. " " .. marker
+  local parts = {}
+  if CFG.MARKER_FRONT then parts[#parts + 1] = marker end
+  if userText ~= "" then parts[#parts + 1] = userText end
+  if not CFG.MARKER_FRONT then parts[#parts + 1] = marker end
+  parts[#parts + 1] = "{" .. table.concat(runs, " ") .. "}"
+  local text = table.concat(parts, " ")
+  if not setNoteVerified(cue, text) then
+    err("Note nicht geschrieben (Cue %s): %s", cueLabel(cue), text)
+    return false
   end
-  if not setProp(cue, "note", newNote) then
-    err("Konnte Note nicht schreiben (Cue %s)", cueLabel(cue))
-  end
+  return true
 end
 
 local function record(seq, cue, delta)
-  local s = loadStats(seq, cue) or { n = 0, sum = 0 }
-  s.n    = s.n + 1
-  s.sum  = s.sum + delta
-  s.min  = s.min and math.min(s.min, delta) or delta
-  s.max  = s.max and math.max(s.max, delta) or delta
-  s.last = delta
-  saveStats(seq, cue, s)
-  writeNote(cue, s)
-  log("Seq %s Cue '%s': %s  %s", tostring(seq.no), cueLabel(cue), fmtTime(delta), markerText(s))
+  local userText, runs, summary = splitNote(cue)
+  if not runs then runs = summary and runsFromSummary(summary) or {} end
+
+  runs[#runs + 1] = math.floor(delta + 0.5)
+  while #runs > CFG.MAX_RUNS do table.remove(runs, 1) end
+
+  local s = statsFromRuns(runs)
+  if writeNote(cue, userText, runs, s) then
+    pcall(DelVar, UserVars(), legacyVarKey(seq, cue))
+    log("Seq %s Cue '%s': %s  %s", tostring(seq.no), cueLabel(cue), fmtTime(delta), markerText(s))
+  end
 end
 
 -- ===================== Live-Timer (Timer-Pool / Clock-Fenster) =====================
@@ -578,7 +625,10 @@ local function doGo(seq)
   local prev = state[seqNo]
   state[seqNo] = { t = t, idx = targetIdx }
 
-  if not recEnabled() then return end
+  if not recEnabled() then
+    log("Aufnahme ist AUS – nichts gespeichert")
+    return
+  end
   if not prev or not before then
     log("Startpunkt gesetzt (Cue '%s')", cueLabel(target))
     return
@@ -591,7 +641,10 @@ local function doGo(seq)
   end
 
   local delta = t - prev.t
-  if delta < CFG.MIN_GAP_SEC then return end
+  if delta < CFG.MIN_GAP_SEC then
+    log("Abstand unter %.1f s – nicht gewertet", CFG.MIN_GAP_SEC)
+    return
+  end
   if delta > maxGapSec() then
     log("Abstand %s > Limit – als Pause gewertet, nicht gespeichert", fmtTime(delta))
     return
@@ -604,10 +657,10 @@ local function doReset(seq)
   local count = 0
   for _, c in ipairs(seq:Children()) do
     if isRealCue(c) then
-      pcall(DelVar, UserVars(), varKey(seq, c))
+      pcall(DelVar, UserVars(), legacyVarKey(seq, c))
       local note = tostring(getProp(c, "note") or "")
       if note:find(MARKER_PATTERN) then
-        setProp(c, "note", stripMarker(note))
+        setProp(c, "note", (splitNote(c)))
         count = count + 1
       end
     end
@@ -617,21 +670,42 @@ local function doReset(seq)
   Printf("[GoTimer] Sequenz %s zurückgesetzt (%d Notes bereinigt)", tostring(seq.no), count)
 end
 
+-- Einmalige Prüfung für die Fehlersuche. Testet das Schreiben an der nächsten Cue und
+-- stellt deren Note danach wieder her. Löst kein Go aus.
+local function doDiag()
+  local function say(fmt, ...) Printf("[GoTimer diag] " .. fmt, ...) end
+  say("Plugin %s, Aufnahme %s, Timer %s", CFG.VERSION, recEnabled() and "AN" or "AUS",
+    timerEnabled() and tostring(timerNumber()) or "AUS")
+
+  local seq = SelectedSequence()
+  if not seq then say("Keine Sequenz selektiert"); return end
+  local cur = currentCue(seq)
+  local target = cur and nextCueAfter(seq, cur) or cur
+  local prev = state[seq.no]
+  say("Sequenz %s, aktuelle Cue %s, Referenz %s", tostring(seq.no),
+    cur and cueLabel(cur) or "keine", prev and "gesetzt" or "keine")
+  if not target then say("Keine Cue zum Testen, bitte einmal Go auslösen"); return end
+
+  local original = tostring(getProp(target, "note") or "")
+  say("Test an Cue '%s', Note bisher: '%s'", cueLabel(target), original)
+  for _, text in ipairs({ "GT Test", "[GT Test]", "GT Test 42 38", "GT Test {42 38}" }) do
+    local ok = setNoteVerified(target, text)
+    say("Schreiben '%s': %s (gelesen: '%s')", text, ok and "OK" or "FEHLER",
+      tostring(getProp(target, "note") or ""))
+  end
+  local restored = setNoteVerified(target, original)
+  say("Note wiederhergestellt: %s", restored and "OK" or "FEHLER")
+end
+
 -- ===================== GUI (MessageBox) =====================
-local BTN = { CLOSE = 0, APPLY = 1, STATS = 2, BREAK = 3, RESET = 4, DISPLAY = 5, MACRO = 6 }
+local BTN = { CLOSE = 0, APPLY = 1, BREAK = 3, RESET = 4, MACRO = 6 }
 local MODES = { "auto", "countdown", "stopwatch" }
 local MODE_VALUE = { auto = 1, countdown = 2, stopwatch = 3 }
 local REFS = { "avg", "last" }
 local REF_VALUE = { avg = 1, last = 2 }
-local STATS_MAX_LINES = 30
 
 local function seqTitle(seq)
   return string.format("Sequenz %s '%s'", tostring(seq.no), tostring(getProp(seq, "name") or ""))
-end
-
-local function statsLine(cue, s)
-  return string.format("%s:  avg %s   %s-%s   letzt %s   n=%d",
-    cueLabel(cue), fmtTime(s.sum / s.n), fmtTime(s.min), fmtTime(s.max), fmtTime(s.last), s.n)
 end
 
 local function headerInfo(seq)
@@ -657,27 +731,6 @@ local function headerInfo(seq)
     lines[#lines + 1] = "Sequenz ist aus."
   end
   return table.concat(lines, "\n")
-end
-
-local function showStats(display, seq)
-  local lines, count, hidden = {}, 0, 0
-  for _, c in ipairs(seq:Children()) do
-    if isRealCue(c) then
-      local s = loadStats(seq, c)
-      if s then
-        count = count + 1
-        if count <= STATS_MAX_LINES then lines[#lines + 1] = statsLine(c, s) else hidden = hidden + 1 end
-      end
-    end
-  end
-  if count == 0 then lines[1] = "Noch keine Messwerte." end
-  if hidden > 0 then lines[#lines + 1] = string.format("... und %d weitere", hidden) end
-  MessageBox({
-    title = "GoTimer – Statistik " .. seqTitle(seq),
-    message = table.concat(lines, "\n"),
-    display = display,
-    commands = { { value = 1, name = "Zurück" } },
-  })
 end
 
 local function confirm(display, title, message)
@@ -768,9 +821,7 @@ local function openGui(display)
       display = display,
       commands = {
         { value = BTN.APPLY, name = "OK" },
-        { value = BTN.DISPLAY, name = "Anzeige" },
         { value = BTN.MACRO, name = "Go-Makro" },
-        { value = BTN.STATS, name = "Statistik" },
         { value = BTN.BREAK, name = "Break" },
         { value = BTN.RESET, name = "Reset Sequenz" },
         { value = BTN.CLOSE, name = "Abbrechen" },
@@ -800,16 +851,10 @@ local function openGui(display)
 
     if btn == BTN.APPLY then
       return
-    elseif btn == BTN.DISPLAY then
-      -- Eigener Plugin-Aufruf, damit die Anzeige nicht in diesem Dialog weiterläuft
-      selfCommand("display")
-      return
     elseif btn == BTN.MACRO then
       showGoMacroResult(display)
     elseif not seq then
       err("Keine Sequenz selektiert")
-    elseif btn == BTN.STATS then
-      showStats(display, seq)
     elseif btn == BTN.BREAK then
       state[seq.no] = nil; clearLive(); stopTimer()
       log("Referenz für Sequenz %s verworfen", tostring(seq.no))
@@ -839,6 +884,8 @@ local function Main(display_handle, argument)
   elseif cmd == "break" then
     local seq = resolveSequence(args[2])
     if seq then state[seq.no] = nil; clearLive(); stopTimer(); log("Referenz für Sequenz %s verworfen", tostring(seq.no)) end
+  elseif cmd == "diag" then
+    doDiag()
   elseif cmd == "display" then
     local a = (args[2] or ""):lower()
     if a == "off" or (a ~= "on" and displayToken) then
@@ -872,7 +919,7 @@ local function Main(display_handle, argument)
   elseif cmd == "reset" then
     local seq = resolveSequence(args[2]); if seq then doReset(seq) end
   else
-    err("Unbekanntes Argument '%s' (go|gui|display|break|rec|reset|timer|tmode)", cmd)
+    err("Unbekanntes Argument '%s' (go|gui|display|diag|break|rec|reset|timer|tmode)", cmd)
   end
 end
 
